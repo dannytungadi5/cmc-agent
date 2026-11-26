@@ -1,8 +1,8 @@
 # cmc-agent
 
-Release candidate v4, 23 November 2026.
+Release candidate v5, 26 November 2026.
 
-A zero-dependency Node.js CLI for CoinMarketCap market-data lookup, deterministic question routing, and local watch-rule evaluation. It does not use an LLM, place trades, forecast prices, or deliver alerts to other services. Proposed track: AI Agents and Automation.
+A zero-dependency Node.js CLI for CoinMarketCap market-data lookup, deterministic question routing, and local watch-rule evaluation with an optional built-in scheduler. It does not use an LLM, place trades, forecast prices, or deliver alerts to other services. Proposed track: AI Agents and Automation.
 
 ## Run locally
 
@@ -37,7 +37,8 @@ API access and quotas depend on your current CMC plan. Trending and OHLCV may re
 | `watch add BTC --above 100000` | Local write only | Add exactly one positive threshold |
 | `watch add ETH --change24h 5` | Local write only | Absolute 24h percentage movement |
 | `watch list`, `watch rm ID` | Local state only | Inspect or remove a rule |
-| `watch run` | `/v2/cryptocurrency/quotes/latest` | One snapshot evaluation, no daemon or external delivery |
+| `watch run` | `/v2/cryptocurrency/quotes/latest` | One snapshot evaluation; exit code 2 when any rule fired |
+| `watch run --every SEC [--max N]` | `/v2/cryptocurrency/quotes/latest` per cycle | Built-in scheduler loop; edge-triggered alerts within the session, one JSON document per cycle with `--json` |
 
 List counts must be integers from 1 to 100. Multiple input symbols are deduplicated and normalized to uppercase. Symbol resolution is a heuristic, not proof of intended identity. Check returned IDs and `map` before relying on a collision-prone ticker. OHLCV and quote selection use different heuristics.
 
@@ -112,10 +113,25 @@ assert v["trust_score"] >= 75, f"untrusted data: {v['trust_score']} ({v['verdict
 There is no SDK and no hidden state between calls: the JSON shape you parse is
 the same one the tests assert on.
 
-## Scheduled watches (cron)
+## Watch scheduling and alerts
 
-`watch run` is designed for an external scheduler; cmc-agent itself starts no
-background process. Example: check watch rules every 5 minutes and log alerts.
+Two ways to run watch rules on a schedule.
+
+Built-in scheduler: `watch run --every SEC` keeps evaluating in a loop (add
+`--max N` to stop after N cycles, Ctrl-C for a clean early stop). Within one
+scheduler session alerts are edge-triggered: a rule prints `ALERT` once when it
+starts firing, `cleared` when its condition resets, and re-arms after that, so
+a crossed threshold does not spam every cycle. With `--json` each cycle prints
+one single-line JSON document (JSONL), carrying `cycle`, `fired`, `new_alerts`,
+`cleared` and `active_rules` for the program consuming it. Intervals under 60
+seconds print a credit warning; 300 or more is recommended on free plans. The
+loop is an ordinary foreground process, so it works under tmux, systemd,
+`nohup`, or a supervisor, and it inherits the usual key resolution; it is not a
+daemon and delivers nothing to external services.
+
+External scheduler (cron) example: check watch rules every 5 minutes and log
+alerts. Single-shot runs stay level-triggered, so a threshold that stays
+crossed alerts on every run; deduplicate downstream if you only want crossings.
 
 ```cron
 */5 * * * * cd /opt/cmc-agent && node cmc-agent.js watch run --json >> /var/log/cmc-watch.jsonl 2>>/var/log/cmc-watch.err
@@ -125,15 +141,16 @@ The key comes from the `CMC_API_KEY` environment variable or `~/.cmc-hack/env`
 of the user cron runs as; it is never read from a command-line flag, so it does
 not appear in the process list.
 
-Rules are level-triggered, so a threshold that stays crossed alerts on every
-run; deduplicate downstream if you only want crossings. Each line appended is
-one JSON document, so the log stays machine-readable.
+Exit codes make watch runs scriptable: 0 = evaluated, no alerts; 2 = at least
+one alert fired (single-shot: in that run; scheduler: at any point in the
+session); 1 = error. A shell can react directly, for example
+`node cmc-agent.js watch run || ./notify-if-code-2 "$?"`.
 
 ## Safety and state
 
 - Price/compare/watch require every requested asset to have a positive finite USD price and a timestamp no older than 15 minutes or more than 5 minutes ahead. Missing, stale and partial results fail closed. Other datasets expose their own observation timestamps where available; a fresh API response does not prove every underlying field is fresh.
 - Missing 24h-change fields do not become zero. Affected watch rules are listed in `unavailable`.
-- Watch rules are level-triggered. Repeated runs can emit the same alert while a threshold remains crossed. No deduplication, crossing-only logic, background scheduling or webhook is claimed.
+- Single-shot watch runs are level-triggered: repeated runs can emit the same alert while a threshold remains crossed. The `--every` scheduler session is edge-triggered per rule (alert on crossing, `cleared` on reset, re-armed after). No cross-session deduplication or webhook delivery is claimed.
 - Corrupt state is rejected, not replaced with an empty list. Writes use a private temporary file plus atomic rename. Concurrent watch writers are not supported; use one writer at a time.
 - Market data can be delayed or incorrect. DEX liquidity is reported liquidity, not a sell quote. No financial advice.
 
@@ -141,7 +158,7 @@ one JSON document, so the log stays machine-readable.
 
 `bash demo.sh` runs live lookups and an isolated temporary watchlist, then removes the temporary state. It prints no secret. It requires a valid key and consumes API credits. `mock.cjs` is only a test preload; fixtures are synthetic and are never a fallback for a failed live call. Never present fixture output as live API evidence.
 
-Run `node --test *.test.cjs`. Set `CMC_EVIDENCE_DIR` to a private folder to save raw successful JSON responses with their endpoint and parameters, never authentication headers. Do not include personal account endpoints in evidence. Offline regression fixtures are separate from fresh live validation. The v4 demo and 16-command live sweep passed on 23 November 2026.
+Run `node --test *.test.cjs`. Set `CMC_EVIDENCE_DIR` to a private folder to save raw successful JSON responses with their endpoint and parameters, never authentication headers. Do not include personal account endpoints in evidence. Offline regression fixtures are separate from fresh live validation. The v4 demo and 16-command live sweep passed on 23 November 2026. The v5 watch scheduler ran against the live API on 26 November 2026: with three BTC rules, a single-shot run fired two alerts and exited 2, and a `--every 20 --max 2` session edge-triggered (cycle 2 printed "no new alerts (2 active)"). Test suite: 63/63.
 
 ## What the API enabled and where it got in the way
 

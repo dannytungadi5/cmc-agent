@@ -1,9 +1,11 @@
 const mode=process.env.CMC_TEST_MODE;
+let flips=0;
 global.fetch=async url=>{
  if(mode==='network')throw new Error('unsafe fixture-key-not-real');
  const u=new URL(url);
  const stamp=mode==='stale'?'2000-01-01T00:00:00Z':mode==='future'?'2100-01-01T00:00:00Z':new Date().toISOString();
  const usd={price:mode==='zero'?0:100,percent_change_1h:1,percent_change_24h:mode==='null'?null:2,percent_change_7d:3,market_cap:1000,volume_24h:20,last_updated:stamp,open:99,high:101,low:98,close:100,volume:20};
+ if(mode==='flip'){usd.price=(++flips%2===0)?300:100;usd.open=usd.price;usd.high=usd.price;usd.low=usd.price;usd.close=usd.price;}
  const asset={id:1,symbol:'BTC',name:'Bitcoin',cmc_rank:1,rank:1,is_active:1,quote:{USD:usd},time_open:stamp};
  if(mode==='depeg'){asset.id=825;asset.symbol='USDT';asset.name='Tether USDt';usd.price=0.9;usd.open=0.9;usd.high=0.9;usd.low=0.9;usd.close=0.9;}
  const eth={...asset,id:1027,symbol:'ETH',name:'Ethereum'};

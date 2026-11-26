@@ -20,11 +20,13 @@
  *   dex pair <network> <address>  Single pair quote by pool contract address
  *   ask "<question>"              Natural-language query with tool-use trace
  *   watch add <SYM> --above X | --below Y | --change24h PCT
- *   watch list | watch rm <id> | watch run [--json]
+ *   watch list | watch rm <id>
+ *   watch run [--every SEC [--max N]] [--json]
  *
  * Config: CMC_API_KEY env var, or CMC_API_KEY= in ~/.cmc-hack/env
  * Options: --json for machine output; --trace writes request evidence to stderr.
  * CMC_CONFIG_DIR isolates watch state and configuration.
+ * Exit codes: 0 = ok, no alerts; 2 = at least one alert fired; 1 = error.
  */
 'use strict';
 const fs = require('fs');
@@ -423,9 +425,15 @@ async function cmdAsk(question) {
   return out;
 }
 
-async function watchRun(asJson) {
+function boundedInt(v, name, min, max) {
+  if (!/^\d+$/.test(String(v ?? '')) || +v < min || +v > max) fail(name + ' must be an integer from ' + min + ' to ' + max);
+  return +v;
+}
+
+async function evaluateWatch() {
   const rules = loadWatch();
   if (!rules.length) fail('watchlist empty | add rules with: watch add BTC --above 100000');
+  const t0 = trace.length, c0 = totalCredits;
   const symbols = [...new Set(rules.map(r => r.symbol))];
   const rows = await cmdPrice(symbols);
   const bySym = Object.fromEntries(rows.map(r => [r.symbol, r]));
@@ -441,15 +449,63 @@ async function watchRun(asJson) {
     if (rule.change24h != null && Number.isFinite(r.change_24h) && Math.abs(r.change_24h) >= rule.change24h) hit = `24h move ${fmtPct(r.change_24h)} (|>= ${rule.change24h}%)`;
     if (hit) fired.push({ id: rule.id, symbol: rule.symbol, alert: hit, price: r.price });
   }
-  const result = { semantics: 'level-triggered snapshot; no background monitoring or delivery', tools: [...trace], checked_at: new Date().toISOString(), rules: rules.length, fired, unavailable, credits: totalCredits };
-  if (asJson) console.log(JSON.stringify(result, null, 2));
-  else {
-    console.log(`checked ${rules.length} rule(s) at ${result.checked_at}`);
-    if (unavailable.length) console.log(`${unavailable.length} rule(s) unavailable: required field missing`);
-    if (!fired.length) console.log('no alerts triggered among evaluable rules');
-    for (const f of fired) console.log(`ALERT [${f.id}] ${f.symbol}: ${f.alert}`);
+  return { tools: trace.slice(t0), checked_at: new Date().toISOString(), rules: rules.length, fired, unavailable, credits: totalCredits - c0 };
+}
+
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+async function watchRun(asJson, every, maxCycles) {
+  if (!every) {
+    const result = await evaluateWatch();
+    result.semantics = 'level-triggered snapshot; no background monitoring or delivery; exit code 2 when any rule fired';
+    if (asJson) console.log(JSON.stringify(result, null, 2));
+    else {
+      console.log(`checked ${result.rules} rule(s) at ${result.checked_at}`);
+      if (result.unavailable.length) console.log(`${result.unavailable.length} rule(s) unavailable: required field missing`);
+      if (!result.fired.length) console.log('no alerts triggered among evaluable rules');
+      for (const f of result.fired) console.log(`ALERT [${f.id}] ${f.symbol}: ${f.alert}`);
+    }
+    if (result.fired.length) process.exitCode = 2;
+    return result;
   }
-  return result;
+  // Built-in scheduler loop. Edge-triggered within the session: a rule alerts
+  // once when it starts firing and re-arms after its condition clears.
+  if (every < 60) console.error('note: interval under 60s can exhaust plan credits; >= 300 recommended');
+  const active = new Map();
+  let cycle = 0, sawAlert = false, stop = false;
+  const onSigint = () => { stop = true; };
+  process.on('SIGINT', onSigint);
+  try {
+    while (!stop && cycle < maxCycles) {
+      cycle++;
+      const r = await evaluateWatch();
+      const nowFired = new Set(r.fired.map(f => f.id));
+      const newAlerts = r.fired.filter(f => !active.has(f.id));
+      const cleared = [...active.keys()].filter(id => !nowFired.has(id));
+      for (const id of cleared) active.delete(id);
+      for (const f of newAlerts) active.set(f.id, f.alert);
+      if (newAlerts.length) sawAlert = true;
+      r.cycle = cycle;
+      r.semantics = 'edge-triggered within this scheduler session; a rule re-arms after its condition clears';
+      r.new_alerts = newAlerts;
+      r.cleared = cleared;
+      r.active_rules = [...active.keys()];
+      if (asJson) console.log(JSON.stringify(r));
+      else {
+        console.log(`[cycle ${cycle}] ${r.checked_at} checked ${r.rules} rule(s)`);
+        for (const f of newAlerts) console.log(`ALERT [${f.id}] ${f.symbol}: ${f.alert}`);
+        for (const id of cleared) console.log(`cleared [${id}]`);
+        if (!newAlerts.length && !cleared.length) console.log(active.size ? `no new alerts (${active.size} active)` : 'no alerts');
+        if (r.unavailable.length) console.log(`${r.unavailable.length} rule(s) unavailable: required field missing`);
+      }
+      if (cycle < maxCycles && !stop) {
+        // interruptible sleep in 250ms slices so Ctrl-C lands quickly
+        for (let waited = 0; waited < every * 1000 && !stop; waited += 250) await sleep(Math.min(250, every * 1000 - waited));
+      }
+    }
+  } finally { process.removeListener('SIGINT', onSigint); }
+  if (stop) console.error('interrupted after ' + cycle + ' cycle(s)');
+  if (sawAlert) process.exitCode = 2;
 }
 
 (async () => {
@@ -552,8 +608,14 @@ async function watchRun(asJson) {
         console.log(asJson ? JSON.stringify(rule) : 'added: ' + JSON.stringify(rule));
       } else if (action === 'list') console.log(JSON.stringify(loadWatch(), null, 2));
       else if (action === 'rm') { if (!wa[0]) fail('usage: watch rm <id>'); const w = loadWatch(); if (!w.some(r => r.id === wa[0])) fail('watch rule not found'); saveWatch(w.filter(r => r.id !== wa[0])); console.log(asJson ? JSON.stringify({removed: wa[0]}) : 'removed ' + wa[0]); }
-      else if (action === 'run') await watchRun(asJson);
-      else fail('usage: watch add|list|rm|run');
+      else if (action === 'run') {
+        const ei = wa.indexOf('--every'), mi = wa.indexOf('--max');
+        const every = ei >= 0 ? boundedInt(wa[ei + 1], '--every', 1, 86400) : null;
+        const maxC = mi >= 0 ? boundedInt(wa[mi + 1], '--max', 1, 10000) : null;
+        if (maxC != null && every == null) fail('--max requires --every');
+        await watchRun(asJson, every, maxC ?? (every ? Infinity : null));
+      }
+      else fail('usage: watch add|list|rm|run [--every SEC [--max N]]');
     } else fail('unknown command: ' + cmd + ' (try: help)');
   } catch (e) { console.error(JSON.stringify({error: e.message, tools: trace})); process.exitCode = e.exitCode || 1; }
   finally { if (withTrace) console.error(JSON.stringify({tools: trace, total_credits: totalCredits})); }
