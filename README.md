@@ -73,6 +73,62 @@ Trace records endpoint, query parameters, request time, response time when suppl
 
 `ask` supports price, top-N, movers, trending, global-market and fear/greed patterns. It is a small pattern router, not a general language model. Unsupported questions and advice/forecast requests fail. Ask JSON carries its tool trace. Other commands use `--trace` for evidence.
 
+## Calling cmc-agent from another program
+
+Every command is scriptable: one JSON document on stdout, structured errors and
+the tool trace on stderr, exit code 0 on success and nonzero on any failure. A
+caller only needs to spawn the process and parse stdout.
+
+```js
+// Node.js: gate a trade signal on verified data
+import { execFileSync } from "node:child_process";
+
+function run(...args) {
+  const out = execFileSync("node", ["cmc-agent.js", ...args, "--json"], { encoding: "utf8" });
+  return JSON.parse(out); // throws (nonzero exit) on any failure - fail closed
+}
+
+const v = run("verify", "BTC");
+if (v.trust_score < 75) throw new Error(`untrusted data: ${v.trust_score} (${v.verdict})`);
+const p = run("price", "BTC");
+console.log(`BTC $${p.assets[0].usd} verified at trust ${v.trust_score}`);
+```
+
+```python
+# Python: the same pattern
+import json, subprocess
+
+def run(*args):
+    out = subprocess.run(
+        ["node", "cmc-agent.js", *args, "--json"],
+        check=True, capture_output=True, text=True,  # check=True: nonzero exit raises
+    )
+    return json.loads(out.stdout)
+
+v = run("verify", "USDT")
+assert v["trust_score"] >= 75, f"untrusted data: {v['trust_score']} ({v['verdict']})"
+```
+
+There is no SDK and no hidden state between calls: the JSON shape you parse is
+the same one the tests assert on.
+
+## Scheduled watches (cron)
+
+`watch run` is designed for an external scheduler; cmc-agent itself starts no
+background process. Example: check watch rules every 5 minutes and log alerts.
+
+```cron
+*/5 * * * * cd /opt/cmc-agent && node cmc-agent.js watch run --json >> /var/log/cmc-watch.jsonl 2>>/var/log/cmc-watch.err
+```
+
+The key comes from the `CMC_API_KEY` environment variable or `~/.cmc-hack/env`
+of the user cron runs as; it is never read from a command-line flag, so it does
+not appear in the process list.
+
+Rules are level-triggered, so a threshold that stays crossed alerts on every
+run; deduplicate downstream if you only want crossings. Each line appended is
+one JSON document, so the log stays machine-readable.
+
 ## Safety and state
 
 - Price/compare/watch require every requested asset to have a positive finite USD price and a timestamp no older than 15 minutes or more than 5 minutes ahead. Missing, stale and partial results fail closed. Other datasets expose their own observation timestamps where available; a fresh API response does not prove every underlying field is fresh.
