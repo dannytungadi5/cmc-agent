@@ -15,6 +15,7 @@
  *   global                        Global market metrics (total mcap, dominance)
  *   fng                           Fear & Greed index
  *   map <SYM>                     Resolve symbol -> CMC id(s) + rank
+ *   verify <SYM>                  Trust score for a symbol's market data (0-100)
  *   dex pairs <dex> <network> [N] Top DEX spot pairs (e.g. uniswap-v3 ethereum)
  *   dex pair <network> <address>  Single pair quote by pool contract address
  *   ask "<question>"              Natural-language query with tool-use trace
@@ -217,6 +218,111 @@ async function cmdMap(sym) {
   return data.slice(0, 5).map(d => ({ id: d.id, symbol: d.symbol, name: d.name, rank: d.rank, active: d.is_active === 1 }));
 }
 
+
+const STABLECOINS = new Set(['USDT', 'USDC', 'DAI', 'FDUSD', 'USDE', 'TUSD', 'PYUSD', 'USDD']);
+
+// cmdVerify: trust score for a symbol's market data (0-100).
+// Answers "can you trust this number?" with deterministic checks over three
+// independent CMC endpoints: quotes, symbol map, and OHLCV.
+async function cmdVerify(sym) {
+  sym = symbolList(sym)[0];
+  const quotes = await api('/v2/cryptocurrency/quotes/latest', { symbol: sym });
+  const map = await api('/v1/cryptocurrency/map', { symbol: sym });
+  const ohlcv = await api('/v2/cryptocurrency/ohlcv/latest', { symbol: sym });
+
+  // resolve the canonical asset the same way `price` does
+  const d = quotes[sym];
+  const cands = (Array.isArray(d) ? d : d ? [d] : []).map(quoteRow)
+    .filter(r => Number.isFinite(r.price) && r.price > 0)
+    .sort((a, b) => (a.rank ?? 9e9) - (b.rank ?? 9e9));
+  if (!cands.length) fail('no priced asset returned for ' + sym);
+  const r = cands[0];
+
+  const mapArr = Array.isArray(map) ? map : [];
+  const active = mapArr.filter(m => m.is_active === 1).sort((a, b) => (a.rank ?? 9e9) - (b.rank ?? 9e9));
+  const ohlcvArr = (Array.isArray(ohlcv[sym]) ? ohlcv[sym] : ohlcv[sym] ? [ohlcv[sym]] : []);
+  const bar = ohlcvArr.find(o => o.id === r.id) || null;
+  const close = bar && bar.quote && bar.quote.USD ? bar.quote.USD.close : null;
+
+  const checks = [];
+  const add = (name, points, max, detail) => checks.push({ name, points, max, detail });
+
+  // 1. resolution clarity: how ambiguous is this symbol
+  const n = active.length || mapArr.length;
+  if (n <= 1) add('resolution_clarity', 20, 20, (active.length || 'no') + ' active match(es); unambiguous');
+  else if ((r.rank ?? 9e9) === 1) add('resolution_clarity', 16, 20, n + ' active matches; resolved to rank #1');
+  else if ((r.rank ?? 9e9) <= 100) add('resolution_clarity', 10, 20, n + ' active matches; resolved to rank #' + r.rank);
+  else add('resolution_clarity', 4, 20, n + ' active matches; resolved to weak rank #' + r.rank);
+
+  // 2. freshness of the quote
+  const ageSec = (Date.now() - Date.parse(r.last_updated)) / 1000;
+  if (!Number.isFinite(ageSec)) add('freshness', 0, 20, 'no quote timestamp');
+  else if (ageSec <= 300) add('freshness', 20, 20, 'quote ' + Math.round(ageSec) + 's old');
+  else if (ageSec <= 900) add('freshness', 14, 20, 'quote ' + Math.round(ageSec / 60) + 'm old');
+  else if (ageSec <= 3600) add('freshness', 6, 20, 'quote ' + Math.round(ageSec / 60) + 'm old');
+  else add('freshness', 0, 20, 'quote ' + Math.round(ageSec / 3600) + 'h old');
+
+  // 3. cross-endpoint consistency: quotes price vs OHLCV close
+  if (!Number.isFinite(close) || close <= 0) add('cross_endpoint_consistency', 0, 20, 'no OHLCV close for resolved id ' + r.id);
+  else {
+    const dev = Math.abs(r.price - close) / r.price;
+    if (dev <= 0.005) add('cross_endpoint_consistency', 20, 20, 'quotes vs OHLCV close differ ' + (dev * 100).toFixed(2) + '%');
+    else if (dev <= 0.02) add('cross_endpoint_consistency', 12, 20, 'quotes vs OHLCV close differ ' + (dev * 100).toFixed(2) + '%');
+    else if (dev <= 0.05) add('cross_endpoint_consistency', 5, 20, 'quotes vs OHLCV close differ ' + (dev * 100).toFixed(2) + '%');
+    else add('cross_endpoint_consistency', 0, 20, 'quotes vs OHLCV close differ ' + (dev * 100).toFixed(2) + '% (endpoint disagreement)');
+  }
+
+  // 4. volume/market-cap sanity
+  const ratio = r.market_cap > 0 ? r.volume_24h / r.market_cap : null;
+  if (ratio === null) add('volume_mcap_sanity', 0, 15, 'no market cap');
+  else if (ratio >= 0.001 && ratio <= 2) add('volume_mcap_sanity', 15, 15, 'volume/mcap ' + ratio.toFixed(4));
+  else if (ratio >= 0.0001 && ratio <= 5) add('volume_mcap_sanity', 8, 15, 'volume/mcap ' + ratio.toFixed(4) + ' (unusual)');
+  else add('volume_mcap_sanity', 0, 15, 'volume/mcap ' + ratio.toFixed(4) + ' (extreme; dead or wash-traded market)');
+
+  // 5. short-term move plausibility
+  if (!Number.isFinite(r.change_1h)) add('move_plausibility', 5, 10, 'no 1h change reported');
+  else if (Math.abs(r.change_1h) <= 15) add('move_plausibility', 10, 10, '1h move ' + r.change_1h.toFixed(2) + '%');
+  else if (Math.abs(r.change_1h) <= 40) add('move_plausibility', 5, 10, '1h move ' + r.change_1h.toFixed(2) + '% (large)');
+  else add('move_plausibility', 0, 10, '1h move ' + r.change_1h.toFixed(2) + '% (possible bad tick)');
+
+  // 6. stablecoin peg (tracked stables) or identity confirmation (others)
+  let cap = null;
+  if (STABLECOINS.has(sym)) {
+    const dev = Math.abs(r.price - 1);
+    const pct = (dev * 100).toFixed(2) + '%';
+    if (dev <= 0.005) add('stablecoin_peg', 15, 15, 'peg deviation ' + pct);
+    else if (dev <= 0.02) add('stablecoin_peg', 8, 15, 'peg deviation ' + pct);
+    else if (dev <= 0.05) { add('stablecoin_peg', 3, 15, 'peg deviation ' + pct); cap = ['CAUTION', 'stablecoin ' + pct + ' off peg']; }
+    else { add('stablecoin_peg', 0, 15, 'peg deviation ' + pct); cap = ['UNRELIABLE', 'stablecoin ' + pct + ' off peg']; }
+  } else {
+    const best = active[0];
+    if (best && best.id === r.id) add('identity_confirmation', 15, 15, 'quote id ' + r.id + ' matches top-ranked map entry');
+    else if (best) add('identity_confirmation', 5, 15, 'quote id ' + r.id + ' != top-ranked map id ' + best.id);
+    else add('identity_confirmation', 10, 15, 'no active map entry to cross-check identity');
+  }
+
+  let score = checks.reduce((s, c) => s + c.points, 0);
+  let verdict = score >= 75 ? 'TRUSTED' : score >= 45 ? 'CAUTION' : 'UNRELIABLE';
+  if (cap) {
+    const order = ['TRUSTED', 'CAUTION', 'UNRELIABLE'];
+    if (order.indexOf(verdict) < order.indexOf(cap[0])) verdict = cap[0];
+    checks.push({ name: 'verdict_cap', points: null, max: null, detail: 'verdict capped at ' + cap[0] + ': ' + cap[1] });
+  }
+
+  return {
+    symbol: r.symbol, id: r.id, name: r.name, rank: r.rank,
+    trust_score: score, verdict,
+    checks,
+    context: {
+      price: r.price, ohlcv_close: close, active_symbol_matches: n,
+      volume_24h: r.volume_24h, market_cap: r.market_cap, change_1h: r.change_1h,
+      quote_age_seconds: Number.isFinite(ageSec) ? Math.round(ageSec) : null,
+      endpoints: ['/v2/cryptocurrency/quotes/latest', '/v1/cryptocurrency/map', '/v2/cryptocurrency/ohlcv/latest'],
+    },
+    note: 'deterministic checks over three CMC endpoints; measures data trustworthiness, not investment quality. Not financial advice.',
+  };
+}
+
 async function cmdDexPairs(dexSlug, networkSlug, n) {
   const data = await api('/v4/dex/spot-pairs/latest', {
     dex_slug: dexSlug, network_slug: networkSlug, limit: n,
@@ -401,6 +507,15 @@ async function watchRun(asJson) {
       if (!sub[0]) fail('usage: map <SYM>');
       const m = await cmdMap(symbolList(sub[0])[0]);
       console.log(JSON.stringify(m, null, 2));
+    } else if (cmd === 'verify') {
+      if (!sub[0]) fail('usage: verify <SYM>');
+      const v = await cmdVerify(sub[0].toUpperCase());
+      if (asJson) console.log(JSON.stringify(v, null, 2));
+      else {
+        console.log(`${v.symbol} ${v.name} (rank #${v.rank ?? '-'})  trust ${v.trust_score}/100  ${v.verdict}`);
+        for (const c of v.checks) console.log(`  ${c.name.padEnd(26)} ${c.points == null ? '  ' : String(c.points).padStart(2)}/${c.max ?? '  '}  ${c.detail}`);
+        console.log('note: ' + v.note);
+      }
     } else if (cmd === 'dex') {
       const [action, ...da] = sub.filter(a => a !== '--json');
       if (action === 'pairs') {

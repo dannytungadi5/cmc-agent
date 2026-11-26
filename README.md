@@ -32,6 +32,7 @@ API access and quotas depend on your current CMC plan. Trending and OHLCV may re
 | `map BTC` | `/v1/cryptocurrency/map` | Up to five returned symbol matches for inspection |
 | `dex pairs uniswap-v3 ethereum 5` | `/v4/dex/spot-pairs/latest` | First returned DEX pairs, capped client-side; no independent ranking claim |
 | `dex pair ethereum POOL_ADDRESS` | `/v4/dex/pairs/quotes/latest` | Reported pool snapshot, not an executable quote or exit guarantee |
+| `verify BTC` | `/v2/cryptocurrency/quotes/latest` + `/v1/cryptocurrency/map` + `/v2/cryptocurrency/ohlcv/latest` | Trust score 0-100 (TRUSTED / CAUTION / UNRELIABLE) for the symbol's market data: symbol-collision count, quote freshness, quotes-vs-OHLCV consistency, volume/mcap sanity, 1h-move plausibility, stablecoin peg deviation (tracked stables). Measures data trustworthiness, not investment quality |
 | `ask "price of bitcoin"` | Deterministic routing to the above | Supported lookup patterns only |
 | `watch add BTC --above 100000` | Local write only | Add exactly one positive threshold |
 | `watch add ETH --change24h 5` | Local write only | Absolute 24h percentage movement |
@@ -39,6 +40,25 @@ API access and quotas depend on your current CMC plan. Trending and OHLCV may re
 | `watch run` | `/v2/cryptocurrency/quotes/latest` | One snapshot evaluation, no daemon or external delivery |
 
 List counts must be integers from 1 to 100. Multiple input symbols are deduplicated and normalized to uppercase. Symbol resolution is a heuristic, not proof of intended identity. Check returned IDs and `map` before relying on a collision-prone ticker. OHLCV and quote selection use different heuristics.
+
+
+## Trust verification (`verify`)
+
+`verify` answers the question every other command raises: can you trust this number?
+It cross-checks one symbol across three independent CMC endpoints and scores the
+result 0-100 with an explainable breakdown:
+
+- **resolution_clarity (20)** - how many active assets share the symbol, and how strong the resolved one is
+- **freshness (20)** - age of the quote timestamp
+- **cross_endpoint_consistency (20)** - quotes price vs OHLCV close for the same CMC ID
+- **volume_mcap_sanity (15)** - volume/market-cap ratio inside plausible bounds
+- **move_plausibility (10)** - |1h change| inside plausible bounds (bad-tick detection)
+- **stablecoin_peg (15)** - for tracked stables (USDT, USDC, DAI, FDUSD, USDE, TUSD, PYUSD, USDD): deviation from $1; a deviation over 2% caps the verdict at CAUTION, over 5% at UNRELIABLE. Non-stables get an identity cross-check (quote ID vs top-ranked map entry) instead
+
+Verdicts: score >= 75 TRUSTED, 45-74 CAUTION, < 45 UNRELIABLE. The score measures
+data trustworthiness for automation and trading decisions; it is not financial
+advice. Live example: `verify BTC` -> 96/100 TRUSTED (9 active matches resolved
+to rank #1), `verify USDT` -> 90/100 TRUSTED (peg deviation 0.13%).
 
 ## Machine output and trace
 
